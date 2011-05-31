@@ -16,82 +16,39 @@
 
 #include "http.h"
 
+#include <iostream>
+using namespace std; //todo get rid of printfs
+
 int max ( int a, int b, int c) {
 	int x = (a > b)?a:b;
 	return (c > x)?c:x;
 }
 
-typedef enum {
-	BadRequest = 0,
-	NotFound
-} HTTPResponse_enum;
-
 #define MAXURLSIZE 100
-
+/*
 HTTPBuffer getHTTPResponse(HTTPResponse_enum r) {
-	/* TODO: Maybe add a header, Connection: close in the response ?? */
-	HTTPBuffer response;
+	 TODO: Maybe add a header, Connection: close in the response ?? */
+	/*HTTPBuffer response;
 	const char *content;
 	char *cptr = response.getbuf();
-
+	//TODO optimize, use snprintf's return val instead of strlen
 	if(r == BadRequest) {
 		content = "<html><head><title>HTTP/400 Bad Request</title></head><body><h1>Bad Request</h1><div>Karshan's proxy server</div></body></html>";
 		snprintf(cptr, BUFSIZE, "HTTP/1.1 400 Bad Request\r\nContent-type: text/html\r\nContent-Length: %d\r\n\r\n%s", (int)strlen(content), content);
 		response.setlen(strlen(cptr));
 	}
-	else /*if(r == Notfound) */ {
+	else if(r == NotFound) {
 		content = "<html><head><title>HTTP/404 Not Found</title></head><body><h1>Not Found</h1><div>Karshan's proxy server</div></body></html>";
 		snprintf(cptr, BUFSIZE, "HTTP/1.1 404 Bad Request\r\nContent-type: text/html\r\nContent-Length: %d\r\n\r\n%s", (int)strlen(content), content);
 		response.setlen(strlen(cptr));
-	}	
+	}
+	else if(r == ConnectionEstablished)*//* {
+		sprintf(cptr, "HTTP/1.1 200 Connection established\r\nProxy-agent: kproxy/1.0\r\n\r\n");
+		response.setlen(strlen(cptr));
+	}
 	return response;
 }
-
-char *urlfromrequest(char* url, const HTTPBuffer req) {
-	int i;
-	char *urlp = strstr(req.getbuf(), "Host:");
-	if(urlp == NULL) 
-		return NULL;
-	urlp += 5; /* strlen("Host:"); */
-	while((*urlp == ' ') || (*urlp == '\t')) urlp++;
-
-	for(i = 0;(i < MAXURLSIZE) && (*urlp != '\r') && (*urlp != '\n') && (*urlp != '\0') && (*urlp != ' ');i++, urlp++)
-		url[i] = *urlp;
-	url[i] = '\0';
-	return url;
-}	
-
-int connectto(char *host, const char *port = "80") {
-	int gai_errno, connectfd = -1;
-	struct addrinfo hints, *saddrinfo;
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_family = AF_INET;
-	hints.ai_socktype = SOCK_STREAM;
-	
-	if((gai_errno = getaddrinfo(host, port, &hints, &saddrinfo)) != 0) {
-		printf("getaddrinfo: %s\n", gai_strerror(gai_errno));
-		return -1;
-	}
-
-	struct addrinfo *p = saddrinfo;
-	do {
-		if(p == NULL) {
-			freeaddrinfo(saddrinfo);
-			return -1;
-		}		
-		connectfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-		if(connectfd != -1) {
-			if(connect(connectfd, p->ai_addr, p->ai_addrlen) == -1) {
-				printf("connect: %s\n", strerror(errno));
-				close(connectfd);
-				connectfd = -1;
-			}
-		}
-		p = p->ai_next;
-	}while(connectfd == -1);
-	freeaddrinfo(saddrinfo); /*We're now connected to the server*/
-	return connectfd;
-}
+*/
 
 int sockfd = -1;
 int logfd = -1;
@@ -102,7 +59,7 @@ int ctid = 0;
 pthread_mutex_t child_count_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void sigint_handler(int signum) {
-	printf("\b\bCaught signal %d\n", signum);
+	fprintf(stderr, "\b\bCaught signal %d\n", signum);
 	if(kpipe[1] != -1)
 		if(write(kpipe[1], "d", 1) == -1)
 			perror("write");
@@ -138,6 +95,8 @@ int main(int argc, char **argv) {
 	socklen_t addr_size = sizeof(struct sockaddr_storage);
 	int reuse_addr = 1;
 	int gai_errno;
+	pthread_attr_t attr;
+	memset(&attr, 0, sizeof(attr));
 	
 	if((logfd = open("log", O_WRONLY | O_CREAT | O_TRUNC, S_IWUSR | S_IRUSR)) == -1) {
 		printf("open: %s\n", strerror(errno));
@@ -149,7 +108,6 @@ int main(int argc, char **argv) {
 		goto cleanup;
 	}
 
-	pthread_attr_t attr;
 	if(pthread_attr_init(&attr)) {
 		printf("pthread_attr_init failed!\n");
 		goto cleanup;
@@ -226,7 +184,9 @@ int main(int argc, char **argv) {
 			printf("pthread_create failed!\n");
 			goto cleanup;
 		}
-		child_count++;
+		pthread_mutex_lock(&child_count_mutex);
+			child_count++;
+		pthread_mutex_unlock(&child_count_mutex);
 	}
 
 cleanup:
@@ -259,20 +219,18 @@ void* conn_handler(void *arg) {
 	printf("conn_handler() %d begin\n", tid);	
 	printf("thread count: %d\n", child_count);
 
-	char url[MAXURLSIZE];
-	int connectfd = -1;
-	int n;
-	HTTPBuffer request, resp;
-	int fd = conn_handler_arg->fd;
+	int n, fd = conn_handler_arg->fd;
+	int connectfd = -1, connect_mode = 0;
+	string olduri;
+	HTTPBuffer buf, req, resp;
+	HTTPRequest request;
 	fd_set rfds;
-	while(1) {
+	//recv() first request
+	while(strstr(buf.getbuf(), "\r\n\r\n") == NULL) {
 		FD_ZERO(&rfds);
 		FD_SET(kpipe[0], &rfds);
 		FD_SET(fd, &rfds);
-		if(connectfd != -1)
-			FD_SET(connectfd, &rfds);
-		
-		if(select(max(fd, kpipe[0], connectfd) + 1, &rfds, NULL, NULL, NULL) == -1) {
+		if(select((fd > kpipe[0])?(fd + 1):(kpipe[0] + 1), &rfds, NULL, NULL, NULL) == -1) {
 			if(errno == EINTR) 
 				continue;
 			perror("select");
@@ -283,65 +241,94 @@ void* conn_handler(void *arg) {
 			goto cleanup;
 
 		if(FD_ISSET(fd, &rfds)) {
-			// recv() request from client
-			if((n = request.recv(fd)) == -1) {
+			if((n = buf.recv(fd)) == -1) {
 				perror("recv");
 				goto cleanup;
 			}
-			if(n == 0) //client closed connection
+			if(n == 0) //client closed connection before we got a request
 				goto cleanup;
+		}
+	}
+	request = buf; //convert buffer to request
+	cout << request;
+	if(request.method.size() == 0 || request.headers.count("Host") == 0) {
+		HTTPBuffer::ssend(fd, BadRequest);
+		goto cleanup;
+	}
 
-			if(request.iscompleterequest()) {
-				request.log(logfd);
+	//FIXME: 2 problems here, one: connect might block indefinitely if given a bad host/port so ctrl-c wont work
+	//two: connect might block indefinitely, and even though the client might click the stop button, i.e.
+	//close fd, we'll still be trying to connect indefinitely (if it was a bad host/port) in which case this thread
+	//will be useless... wont chew cpu since its in a syscall but it will prevent ctrl-c from working...
+	//a quick BAD fix would be add a 5 second timeout (NOT using select())
+	if((connectfd = HTTP::connect(request)) == -1)
+		cout << "HTTP::connect failed\n";
+	
+	if(request.method == "CONNECT") { connect_mode = 1; HTTPBuffer::ssend(fd, ConnectionEstablished); }
+	else {
+		if(buf.send(connectfd) == -1) {
+			perror("send");
+			goto cleanup;
+		}
+	}
+	olduri = request.uri;
+	while(1) {
+		FD_ZERO(&rfds);
+		FD_SET(kpipe[0], &rfds);
+		FD_SET(fd, &rfds);
+		FD_SET(connectfd, &rfds);
+		if(select(max(fd, kpipe[0], connectfd) + 1, &rfds, NULL, NULL, NULL) == -1) {
+			if(errno == EINTR) 
+				continue;
+			perror("select");
+			goto cleanup;
+		}
 
-				/* we have a complete request */
-				if(urlfromrequest(url, request) == NULL) {
-					resp = getHTTPResponse(BadRequest);
-					resp.send(fd);
-					goto cleanup;
-				}
-				if(connectfd != -1)
-					close(connectfd);
-				connectfd = connectto(url);
-				
-				if(connectfd == -1) {
-					printf("connect fd failed!\n");
-					resp = getHTTPResponse(NotFound);
-					resp.send(fd);
-					goto cleanup;
-				}
-				if(request.send(connectfd) == -1) {
-					resp = getHTTPResponse(NotFound);
-					resp.send(fd);
-					goto cleanup;
-				}
-				request.reset();
+		if(FD_ISSET(kpipe[0], &rfds))
+			goto cleanup;
+
+		else if(FD_ISSET(fd, &rfds)) {
+			if((n = req.recv(fd)) == -1) {
+				perror("recv");
+				goto cleanup;
 			}
-			/* TODO:else{ send HTTP\1.1 continue .. or whatever }*/
+			if(n == 0)
+				goto cleanup;
+			if(connect_mode) {
+				req.send(connectfd);
+				req.reset();
+			}
+			else if(strstr(req.getbuf(), "\r\n\r\n") != NULL) {
+				request = req;
+				if(request.uri != olduri) {
+					printf("new request diff. uri\n");
+					goto cleanup;
+				}
+				if(req.send(connectfd) == -1) {
+					perror("send");
+					goto cleanup;
+				}
+				req.reset();
+			}
 		}
 		else if(FD_ISSET(connectfd, &rfds)) {
 			if((n = resp.recv(connectfd)) == -1) {
 				perror("recv");
 				goto cleanup;
 			}
-			if(n == 0) {
-				/* server closed connection */
-				close(connectfd);
-				connectfd = -1;	
+			if(n == 0) { //server closed connection 
+				cout << "server closed connection\n";
+				goto cleanup;
 			}
-			else {
-				/* TODO: only send response once its fully recieved! */
-				resp.send(fd);
-				resp.reset();	
-			}
+			resp.send(fd);
+			resp.reset();
 		}
 	}
+
 cleanup:
 	printf("conn_handler() %d end\n", conn_handler_arg->tid);
 	if(close(fd) == -1)
 		perror("close fd");
-	if(connectfd != -1)
-		close(connectfd);
 	free(conn_handler_arg->t_ptr);
 	free(conn_handler_arg);	
 	printf("thread count: %d\n", child_count);
