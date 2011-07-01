@@ -1,6 +1,5 @@
 A simple HTTP proxy server in c/c++
 
-currently only works for http connections, not https
 the idea was to have a simple proxy server so anyone can
 modify the code and hack around with websites.
 
